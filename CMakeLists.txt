@@ -93,6 +93,15 @@ if (LLAMA_STANDALONE)
     # enable parallel builds for msbuild
     list(APPEND CMAKE_VS_GLOBALS UseMultiToolTask=true)
     list(APPEND CMAKE_VS_GLOBALS EnforceProcessCountAcrossBuilds=true)
+
+    find_program(CCACHE_PROGRAM ccache)
+    if (CCACHE_PROGRAM AND MSVC)
+        cmake_path(GET CCACHE_PROGRAM PARENT_PATH CCACHE_DIR)
+        list(APPEND CMAKE_VS_GLOBALS "CLToolExe=ccache.exe")
+        list(APPEND CMAKE_VS_GLOBALS "CLToolPath=${CCACHE_DIR}")
+        list(APPEND CMAKE_VS_GLOBALS "TrackFileAccess=false")
+        set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "Embedded")
+    endif()
 endif()
 
 if (CMAKE_SYSTEM_NAME STREQUAL "iOS")

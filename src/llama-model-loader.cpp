@@ -1311,7 +1311,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list;
         switch (info.layer) {
             case LLM_TENSOR_LAYER_INPUT:
-                buft_list = buft_list_input;
+                buft_list = buft_list_output;
                 break;
             case LLM_TENSOR_LAYER_OUTPUT:
                 buft_list = buft_list_output;
