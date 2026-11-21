@@ -67,3 +67,81 @@
    * **Audit Vulkan Compute & Scratch Buffer Allocations (`ggml-vulkan.cpp`)**: Inspect `prealloc_size_x`, `prealloc_size_y`, `prealloc_size_split_k`, and `vk_pool` staging allocations to trim unused or oversized persistent scratch buffers on `n = 1` / small-batch inference.
    * **Hybrid Architecture KV Cache Sizing**: Because `Qwen3.8-4B` is a hybrid Gated DeltaNet + Attention architecture (only 8 of 32 layers use full KV attention while 24 layers use fixed-size recurrent state), audit KV cache allocation (`-c` sizing and recurrent cell reservation) to reclaim unused VRAM without altering precision (`F16` KV).
    * **Sub-Allocation / Buffer Aliasing for `token_embd.weight` vs. Compute Graph**: Check whether `ggml-backend` graph allocator over-reserves `Vulkan0` compute buffers alongside the 4.28 GiB model weights on 8 GB VRAM.
+
+
+\---
+
+
+
+\## Experiment: MTP speculative decoding (draft-mtp) - REJECTED
+
+
+
+\### Environment
+
+\- GPU: AMD Radeon RX 6600, 8 GB, RDNA 2, 28 CU
+
+\- Model: Qwen3.8-4B-Q8\_0.gguf (qwen35 arch, 33 blocks, 8 full-attn + 24 SSM)
+
+\- Build: b12604-1f895bed0, MSVC 19.51, Windows 11
+
+\- Flags: -ngl 99 -fa on, GGML\_VK\_DISABLE\_HOST\_VISIBLE\_VIDMEM=1
+
+\- Workload: 18-token prompt, -n 128, measured under concurrent GPU load
+
+
+
+\### Results (under load, same session)
+
+
+
+| Config | tg t/s | Prompt eval t/s | Delta vs non-MTP |
+
+| --- | --- | --- | --- |
+
+| Non-MTP (anchor) | 7.99 | 48.6 | - |
+
+| MTP n=3 | 6.49 | 28.1 | -19% |
+
+| MTP n=4 | 5.70 | 30.3 | -29% |
+
+
+
+\### Acceptance profile
+
+\- n=3: rate 0.210, mean acc len 1.63, per-pos (0.397, 0.192, 0.038)
+
+\- n=4: rate 0.166, mean acc len 1.66, per-pos (0.474, 0.145, 0.039, 0.000)
+
+
+
+\### Diagnosis
+
+Position-4 acceptance was exactly 0.000 across 76 drafts. Positions 3 and 4 accept at about 4% and 0%. The verifier still runs a 4-5 token batch to check drafts that are almost never correct, which pushes work off the fast mat-vec path. At 28 CU and Q8\_0 weights the verification overhead never amortizes. MTP also roughly halves prompt-eval throughput (48.6 -> 28-30 t/s).
+
+
+
+\### Decision
+
+Do not use draft-mtp on this hardware. Non-MTP 7.99 t/s under load is the current generation baseline. The 10.36 t/s figure elsewhere in this file was measured unloaded and is not directly comparable.
+
+
+
+\### Measurement caveats
+
+\- One run per config. Thermal drift was significant: an early unloaded n=4 run hit 8.85 t/s, later loaded runs fell to 5.70.
+
+\- Treat MTP figures as +/- 10%. The direction is unambiguous; the exact values are not.
+
+\- --temp 0 does NOT make MTP runs comparable across n\_max. The draft head samples and consumes RNG before verification, so accepted-token paths diverge at step 1 regardless of seed.
+
+
+
+\### Incidental findings (relevant to next optimization)
+
+\- Context was auto-shrunk from 262144 to 60672 by common\_fit\_params (projected 12841 MiB vs 7378 MiB free).
+
+\- KV cache at 60672 ctx = 1896 MiB (8 KV layers, K and V f16 at 948 MiB each). Dropping to -c 8192 frees about 1.6 GB losslessly.
+
+\- Context checkpoints default to 32 slots at 50.25 MiB each, up to about 1.6 GB VRAM if they accumulate.
+

@@ -153,3 +153,11 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# local scratch
+*.bak
+vk_log.txt
+fix.ps1
+New Text Document.txt
+mtp_findings_snippet.md
+mtp_baseline.log
