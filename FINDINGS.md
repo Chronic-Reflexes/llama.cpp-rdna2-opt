@@ -255,3 +255,97 @@ Maximum context with no performance cost, 872 MiB freed versus the auto-fit valu
 
 - Regression cause at 60672 is inferred from the cliff shape, not profiled. Candidate explanations: driver paging at high allocation, allocator fragmentation, or a prealloc_size bucket boundary. Worth confirming with GGML_VK_PERF_LOGGER.
 
+
+---
+
+## Session 2: Measurement methodology, K_PER_ITER, and VRAM-exhaustion cliff
+
+### Critical methodology: GPU-accelerated background apps
+
+**Discord's GPU compositor was running through every measurement in the first half of this session.**
+
+Closing Discord changed the numbers by ~18%:
+
+| Condition | Gen t/s | Prompt t/s | Unaccounted VRAM |
+| --- | --- | --- | --- |
+| Discord open | 10.8 | 68 | 2726 MiB |
+| Discord closed | 12.7 | 76 | 1827 MiB |
+
+Discord held ~900 MiB of VRAM and a competing GPU queue. All earlier figures in this file that were measured with Discord open should be read as understated by ~18% throughput and ~900 MiB VRAM.
+
+**Mandatory precondition for all future benchmarks: close Discord (and any other GPU-accelerated apps: browsers with hardware accel, OBS, Adobe background services) before measuring.**
+
+### Thermal behavior: back-to-back is valid
+
+Two sets of 3 runs, both with Discord closed:
+
+- 30s cooldown between reps: 12.2 / 12.2 / 12.4
+- No cooldown, back-to-back: 12.2 / 12.1 / 12.1
+
+Delta between cooled and heat-soaked: ~0.1 t/s. The RX 6600 does not thermally throttle at this workload. Back-to-back measurement is valid; the "thermal drift" observed earlier in the session was actually Discord queue contention, not temperature.
+
+### New baseline (canonical)
+
+| Config | Gen t/s | Prompt t/s |
+| --- | --- | --- |
+| **-fit off -c 32768 --ctx-checkpoints 1, Discord closed, K_PER_ITER=8** | **12.7** | **76** |
+
+Three reps: 12.7 / 12.8 / 12.7. Plus +/- 0.1 tolerance.
+
+This supersedes the 10.8 figure from the previous section. The context-cap finding from that section should be re-read with this baseline: **7.99 (auto, Discord open) -> 12.7 (capped, Discord closed) is +59%, not +35%.**
+
+### Experiment: K_PER_ITER=16 for Q8_0 on RDNA2 - REJECTED
+
+`ggml/src/ggml-vulkan/vulkan-shaders/mul_mat_vecq.comp`, line 18 (the `DATA_A_QUANT_LEGACY` branch that covers Q8_0):
+
+- Default (upstream): `#define K_PER_ITER 8`
+- Tested: `#define K_PER_ITER 16`
+
+Result with Discord closed, 3 reps each:
+
+| K_PER_ITER | Gen t/s | Prompt t/s |
+| --- | --- | --- |
+| 8 (default) | 12.7 / 12.8 / 12.7 | 72-80 |
+| 16 | 12.2 / 12.1 / 12.1 | 74-79 |
+
+**16 is ~4% slower than 8.** Not neutral, actually worse. The earlier "9.9 t/s regression" was Discord noise, but the reversal is real. Reverted to 8 and keeping the upstream default.
+
+Why 16 loses: the m=9216 and m=2560 dispatches that dominate ffn_up/ffn_down don't bottleneck on k-loop unroll factor. Larger K_PER_ITER increases register pressure and reduces occupancy without changing the underlying memory-latency-hiding behavior. The lm_head dispatch (m=248320) that hits 96% of peak already demonstrates that the kernel is fine when dispatch size is large enough — the issue is dispatch size, not unroll factor.
+
+### VRAM-exhaustion cliff at c=60672 - CONFIRMED
+
+Same settings as baseline, only `-c 60672`:
+
+| Config | Gen t/s | KV MiB | Free VRAM |
+| --- | --- | --- | --- |
+| c=32768 | 12.7 | 1024 | ~966 |
+| c=60672 | 9.0 | 1896 | 0 |
+
+Memory breakdown at c=60672 (Discord closed):
+
+| Component | MiB |
+| --- | --- |
+| model | 4264 |
+| context (KV) | 1946 |
+| compute | 138 |
+| unaccounted (DWM/driver) | 1827 |
+| **total** | **8175 (= 0 free)** |
+
+The "cliff" is literal VRAM exhaustion, not an allocator boundary. At 60672 there is no headroom for the driver's own paging and staging, and throughput collapses by 29%.
+
+**The 1827 MiB unaccounted is a hard floor** on Windows 11 + Adrenalin for this card. It's not llama.cpp's allocation and cannot be recovered by tweaking `prealloc_size` or `vk_pool`. The remaining known reduction is running headless (no display compositor), which is not viable for interactive use.
+
+### Updated bandwidth ceiling context
+
+Per token, weights streamed = 4316 MB. At 12.7 t/s = 78 ms/token = **55 GB/s effective**.
+RX 6600 theoretical HBM = ~224 GB/s. Real achievable ~200 GB/s.
+**Current efficiency: ~27% of peak.** Was ~24% before this session's fixes.
+
+Profile confirms this: lm_head dispatch runs at 96% of peak (405 GFLOPS/s), but the medium-m dispatches that dominate runtime (ffn_up at m=9216, ffn_down at m=2560, SSM at m=8192) run at 21-26% of peak. The gap is dispatch size, not kernel quality, not ubatch sizing, not K_PER_ITER.
+
+### Next experiments (in priority order)
+
+1. **Fuse gate+up and Q/K/V dispatches** in `ggml-vulkan.cpp`. The profile shows 85% of generation time sits in medium-m dispatches; doubling dispatch size (via fusion) tests whether that alone lifts efficiency. Highest expected payoff.
+2. **Investigate the 1827 MiB unaccounted VRAM floor** - if DWM/driver is holding more than necessary, reducing it directly expands the context cap.
+3. **Subgroup-only reduce (`USE_SUBGROUP_ADD_NO_SHMEM`)** for MMVQ kernels - eliminates workgroup barriers, potential 5-15% on medium-m.
+4. **Prefetch / occupancy audit** in `mul_mat_vecq.comp` - only worth doing if fusion doesn't recover efficiency.
