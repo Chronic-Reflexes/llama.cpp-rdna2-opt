@@ -1,6 +1,7 @@
 # FINDINGS.md — Live Benchmark Log & Technical Findings
 
 > **Purpose**: Living log of benchmark measurements, verified optimizations, failed experiments, and current GPU bottlenecks for `Qwen3.8-4B-Q8_0.gguf` on AMD Radeon RX 6600 (`AMD_RDNA2`, Windows 11 Vulkan).  
+> **Project Goal**: Maximize both **inference performance (tokens/sec)** and **VRAM savings** while maintaining **100% mathematical/output accuracy with zero degradation to model knowledge or skills** (lossless graph, memory-layout, shader, and buffer optimizations only).  
 > **Coding rules & workflow**: See [`AGENTS.md`](./AGENTS.md).
 
 ---
@@ -20,10 +21,10 @@
 
 ---
 
-## 2. Verified Wins (Keep)
+## 2. Verified Lossless Wins (Keep)
 
 1. **Pure `DEVICE_LOCAL` GDDR6 Allocations (`GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1`)**:
-   * Bypassed AMD Windows ReBAR `HOST_VISIBLE | DEVICE_LOCAL` read penalty, boosting raw `tg32` from `3.08 t/s` to `7.90 t/s` (+156%).
+   * Bypassed AMD Windows ReBAR `HOST_VISIBLE | DEVICE_LOCAL` read penalty, boosting raw `tg32` from `3.08 t/s` to `7.90 t/s` (+156%) with bit-identical math.
 2. **Eliminating CPU Fallback on `token_embd.weight` (`src/llama-model-loader.cpp`)**:
    * `LLM_TENSOR_LAYER_INPUT` (644 MiB `Q8_0`) previously fell back to `CPU_Mapped` because `Vulkan_Host` rejected `Q8_0`. Assigning `buft_list = buft_list_output` put 100% of all 1,905 graph nodes on `Vulkan0` (`splits = 1`).
 3. **`DMMV_WG_SIZE_LARGE` (128 threads) + `NUM_ROWS = 1` for `Q8_0` (`ggml-vulkan.cpp`)**:
@@ -54,11 +55,15 @@
 
 ---
 
-## 5. Open Next Steps (Prioritized)
+## 5. Open Next Steps (Lossless Performance & VRAM Optimizations Only)
 
-1. **Benchmark End-to-End MTP Speculative Decoding (`llama-cli` / `llama-server`)**:
-   * Build `llama-cli` and `llama-server` and measure real-world generation speed with `--spec-type draft-mtp --spec-draft-n-max 4` on top of the `10.36 t/s` base forward pass (~81.7% acceptance, mean length 4.27 -> expected **~25–35+ t/s**).
-2. **Eliminate Shared-Memory Barriers on `m = 2560..9216` (`USE_SUBGROUP_ADD_NO_SHMEM`)**:
-   * Investigate running 1 wave32 (`32` threads) per row with `USE_SUBGROUP_ADD_NO_SHMEM` (`subgroupAdd` only, zero workgroup `barrier()`) or fusing `Q/K/V` & `Gate+Up` projections to close the ~45 GB/s vs. ~205 GB/s bandwidth gap.
-3. **Evaluate `Q4_K_M` / `IQ4_XS` Quantization**:
-   * Halving active weight reads (~1.9 GB vs. ~3.65 GB) on bandwidth-bound layers could double raw `tg32` to **~18–20+ t/s** (**~45–60+ t/s** with MTP).
+> **Constraint**: Do **not** use lossy weight re-quantization (e.g., `Q4_K_M`, `IQ4_XS`) or lossy KV compression. Every optimization below preserves 100% mathematical/output fidelity of `Qwen3.8-4B-Q8_0.gguf`.
+
+1. **Benchmark End-to-End Lossless MTP Speculative Decoding (`llama-cli` / `llama-server`)**:
+   * Build `llama-cli` and `llama-server` and measure real-world generation speed and VRAM footprint with `--spec-type draft-mtp --spec-draft-n-max 4` on top of the `10.36 t/s` base forward pass (~81.7% acceptance, mean length 4.27 -> expected **~25–35+ t/s** with zero accuracy change because target verification is exact).
+2. **Eliminate Shared-Memory Barriers on `m = 2560..9216` (`USE_SUBGROUP_ADD_NO_SHMEM`) & Operator Fusion**:
+   * Investigate running 1 wave32 (`32` threads) per row with `USE_SUBGROUP_ADD_NO_SHMEM` (`subgroupAdd` only, zero workgroup `barrier()`) or fusing `Q/K/V` and `Gate+Up` projections into single dispatches to close the ~45 GB/s vs. ~205 GB/s bandwidth gap while also eliminating intermediate activation buffers.
+3. **Lossless VRAM Footprint Reductions (Fit Larger Contexts Inside 8 GB GDDR6)**:
+   * **Audit Vulkan Compute & Scratch Buffer Allocations (`ggml-vulkan.cpp`)**: Inspect `prealloc_size_x`, `prealloc_size_y`, `prealloc_size_split_k`, and `vk_pool` staging allocations to trim unused or oversized persistent scratch buffers on `n = 1` / small-batch inference.
+   * **Hybrid Architecture KV Cache Sizing**: Because `Qwen3.8-4B` is a hybrid Gated DeltaNet + Attention architecture (only 8 of 32 layers use full KV attention while 24 layers use fixed-size recurrent state), audit KV cache allocation (`-c` sizing and recurrent cell reservation) to reclaim unused VRAM without altering precision (`F16` KV).
+   * **Sub-Allocation / Buffer Aliasing for `token_embd.weight` vs. Compute Graph**: Check whether `ggml-backend` graph allocator over-reserves `Vulkan0` compute buffers alongside the 4.28 GiB model weights on 8 GB VRAM.
