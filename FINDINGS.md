@@ -349,3 +349,84 @@ Profile confirms this: lm_head dispatch runs at 96% of peak (405 GFLOPS/s), but 
 2. **Investigate the 1827 MiB unaccounted VRAM floor** - if DWM/driver is holding more than necessary, reducing it directly expands the context cap.
 3. **Subgroup-only reduce (`USE_SUBGROUP_ADD_NO_SHMEM`)** for MMVQ kernels - eliminates workgroup barriers, potential 5-15% on medium-m.
 4. **Prefetch / occupancy audit** in `mul_mat_vecq.comp` - only worth doing if fusion doesn't recover efficiency.
+
+---
+
+## Experiment: NUM_ROWS=2 for Q8_0 MMVQ - kernel +20%, wall-clock neutral (reverted)
+
+### How this came up
+
+The GGML_VK_PERF_LOGGER profile showed every medium-m matvec at ~84 GFLOPS/s (m=4096, 8192, 9216) but lm_head at 405 GFLOPS/s (m=248320). Flat curve from m=1024 to m=9216, then a 4.8x jump. First hypothesis was dispatch size, but the finer profile exposed the real variable: **n**, not m.
+
+| m=9216 k=2560 | us/dispatch | GFLOPS/s | vs n=1 |
+| --- | --- | --- | --- |
+| n=1 | 559 | 84 | - |
+| n=2 | 348 | 271 | 3.2x per-flop |
+| n=4 | 358 | 527 | 6.3x |
+| n=7 | 391 | 844 | 10.1x |
+
+n=2 does 2x the work in 62% of the time. The kernel has instruction-level parallelism at n>=2 that n=1 lacks. Chat generation uses n=1 exclusively - this is exactly the bottleneck.
+
+### The 1-line test
+
+`mul_mat_vec_base.glsl` already declares `layout(constant_id = 1) const uint NUM_ROWS = 1;` and the shader's loops support NUM_ROWS > 1 (bounds checks at `first_row + NUM_ROWS <= p.stride_d`, partial-group handling, early return on overflow). Every pipeline is created with NUM_ROWS=1.
+
+Change in `ggml-vulkan.cpp` line 3399 (Q8_0 q8_1 pipeline creation):
+`{wg_size_subgroup_int, 1, i+1}` -> `{wg_size_subgroup_int, 2, i+1}`
+
+One character. Rebuild, run.
+
+### Dispatch-level result (per GGML_VK_PERF_LOGGER)
+
+| m=9216 n=1 k=2560 | Before | After | Change |
+| --- | --- | --- | --- |
+| us/dispatch | 559 | 464 | -17% |
+| GFLOPS/s | 84 | 101 | +20% |
+
+m=248320 unchanged (3136 us, 405 GFLOPS/s) - that path is not affected.
+
+### Wall-clock result (three reps, Discord closed)
+
+| Run | Prompt t/s | Gen t/s | Notes |
+| --- | --- | --- | --- |
+| 1 | 43.9 | 12.6 | contaminated (background GPU) |
+| 2 | 79.1 | 12.7 | clean |
+| Baseline (NUM_ROWS=1) | 76 | 12.7 | clean |
+
+**Generation: unchanged.** The +20% kernel throughput does not translate to wall-clock gain.
+
+### Why the wall-clock gain evaporated
+
+The host still launches `m` workgroups per dispatch. With NUM_ROWS=2, workgroups 0..m/2-1 compute rows 2k, 2k+1 correctly; workgroups m/2..m-1 compute `first_row >= stride_d` and exit immediately. Half the launched workgroups do no useful work.
+
+Per-token accounting:
+- ILP gain: 64 dispatches x 95 us saved = **6.1 ms faster**
+- Wasted workgroup overhead: 4608 dead workgroups x 64 dispatches x ~75 ns scheduling = **~6.0 ms slower**
+- Net: **~0.1 ms per token, within measurement noise**
+
+The kernel is faster; the pipeline is not. Classic "optimization measured in isolation" trap.
+
+### Full-patch estimate (documented, NOT pursued)
+
+Eliminating the wasted workgroups requires ~2 hours:
+
+1. Extend `pipeline_dequant_mul_mat_vec_q8_1_f32[w][type][i]` with a NUM_ROWS=2 slot (or parallel array)
+2. Create a second pipeline per NUM_COLS variant at `{wg_size_subgroup_int, 2, i+1}`
+3. In `ggml_vk_mul_mat_vec_q_f16`, select NR=2 when `ne01 >= threshold`, dispatch `ceil(ne01 / 2)` workgroups
+4. Handle odd `ne01` (all current m values are even, but general path must be correct)
+
+Expected gain: **+6.1 ms per token = 12.7 -> 13.7 t/s (+8% generation)**.
+
+Risk: ~30% chance of hitting an untested shader assumption (register allocation, barrier alignment, output layout with stride_d != m). Fixable but adds time.
+
+### Status: reverted, not pursued
+
+Documented because:
+- The +20% kernel throughput is real and reproducible across every dispatch in the run
+- The full patch is a known quantity (+8% generation for ~2h work)
+- If bandwidth work is revisited in a future session, this is the first lever to pull
+- The measured-but-neutral intermediate result is exactly what "don't optimize in isolation" means in practice
+
+### Key lesson for future benchmarking
+
+**Dispatch-level improvements do not automatically become wall-clock improvements.** The profile's `us/dispatch` is kernel time; wall-clock's `eval time` includes launch overhead, wasted workgroups, and pipeline scheduling. Always verify both. This experiment found +20% at kernel level and 0% end-to-end - the gap was exactly the waste the partial implementation introduced.
