@@ -145,3 +145,113 @@ Do not use draft-mtp on this hardware. Non-MTP 7.99 t/s under load is the curren
 
 - Context checkpoints default to 32 slots at 50.25 MiB each, up to about 1.6 GB VRAM if they accumulate.
 
+
+
+---
+
+
+
+## Experiment: Context size cap as a lossless 35% speedup - ACCEPTED
+
+
+
+### Summary
+
+On the RX 6600 (8 GB), letting `--fit` auto-select context size caused a 27% generation regression. Capping context at 32768 with `-fit off` recovers that losslessly, and a context size of 32768 costs nothing versus 8192. Output tokens are byte-identical across all configurations.
+
+
+
+### Environment
+
+- GPU: AMD Radeon RX 6600, 8 GB, RDNA 2, 28 CU
+
+- Model: Qwen3.8-4B-Q8_0.gguf (qwen35 arch, 33 blocks, 8 full-attn + 24 SSM)
+
+- Build: b12604-1f895bed0, MSVC 19.51, Windows 11
+
+- Flags: -ngl 99 -fa on --ctx-checkpoints 1 -st -s 42, GGML_VK_DISABLE_HOST_VISIBLE_VIDMEM=1
+
+- Workload: 18-token prompt, -n 128, measured under concurrent GPU load
+
+- Note: this is the NON-MTP baseline. See the MTP section above for why MTP was rejected.
+
+
+
+### The curve
+
+
+
+| Context | Fit | KV buffer | Checkpoints | Generation | Prompt eval |
+
+| --- | --- | --- | --- | --- | --- |
+
+| 8192 | off | 256 MiB | 1 | 10.80 t/s | 69.6 t/s |
+
+| 16384 | off | 512 MiB | 1 | 10.81 t/s | 70.2 t/s |
+
+| 32768 | off | 1024 MiB | 1 | 10.76 t/s | 69.3 t/s |
+
+| 60672 | on (auto) | 1896 MiB | 32 max | 7.99 t/s | 48.6 t/s |
+
+
+
+8192 through 32768 are flat within +/- 0.03 t/s. The regression appears only at the auto-selected 60672, which is a cliff, not a slope.
+
+
+
+### KV cache math (verified against runtime logs)
+
+- 32.0 KiB per token = 8 full-attn layers x 2 (K,V) x 4 KV heads x 256 dim x 2 bytes (f16)
+
+- 8192  -> 256 MiB
+
+- 16384 -> 512 MiB
+
+- 32768 -> 1024 MiB
+
+- 60672 -> 1896 MiB
+
+
+
+The other 24 layers use Gated DeltaNet recurrent state (50.25 MiB, fixed, context-independent).
+
+
+
+### What changed
+
+- `-fit off` stops `common_fit_params` from silently projecting 12841 MiB against 7378 MiB free and shrinking context to 60672. We choose the context explicitly instead.
+
+- `-c 32768` caps the KV allocation below the cliff.
+
+- `--ctx-checkpoints 1` caps recurrent-state snapshots. Each checkpoint is a full copy of the 50.25 MiB SSM state; default max is 32 (\~1.6 GiB ceiling). The "context does not support partial sequence removal" warning means checkpoints are the only prefix-reuse mechanism on this hybrid arch, so 1 is the practical minimum for single-slot chat.
+
+
+
+### Secondary effect
+
+The Vulkan compute buffer also shrank: 138.27 MiB -> 95.02 MiB (-43 MiB), and Vulkan_Host compute 69.27 -> 26.02 MiB. The scheduler reserves scratch proportional to context size, which is a second, unplanned saving.
+
+
+
+### Why it is lossless
+
+Context size and checkpoint count change memory layout only. They do not touch weights, precision, KV dtype (f16), kernels, or sampling. Verified: the generated text is identical word for word across 8192 / 16384 / 32768 / 60672 at fixed seed.
+
+
+
+### Recommended settings
+
+`-fit off -c 32768 --ctx-checkpoints 1`
+
+Maximum context with no performance cost, 872 MiB freed versus the auto-fit value.
+
+
+
+### Caveats
+
+- Measured on short prompt (18 tokens) and 128-token decode. Long-context prefill (thousands of tokens) touches KV read bandwidth differently and is UNTESTED.
+
+- The 32768 data point is a single run (10.76 t/s); 16384 is confirmed across 3 reps (10.79 / 10.80 / 10.81).
+
+- Regression cause at 60672 is inferred from the cliff shape, not profiled. Candidate explanations: driver paging at high allocation, allocator fragmentation, or a prealloc_size bucket boundary. Worth confirming with GGML_VK_PERF_LOGGER.
+
